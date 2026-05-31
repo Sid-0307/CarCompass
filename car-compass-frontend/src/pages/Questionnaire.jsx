@@ -21,12 +21,12 @@ import QuestionCard from '../components/QuestionCard.jsx'
 import { getRecommendations } from '../api/client.js'
 
 // ── Pill button ───────────────────────────────────────────────────────────────
-function Pill({ label, selected, onClick, disabled }) {
+function Pill({ label, selected, onClick, disabled, fullWidth }) {
   return (
     <button
       onClick={onClick}
       disabled={disabled}
-      className="px-5 py-3 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer"
+      className={`${fullWidth ? 'w-full ' : ''}px-5 py-3 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer`}
       style={{
         backgroundColor: selected ? '#14b8a6' : 'transparent',
         color: selected ? '#0a0f0f' : '#e8f5f5',
@@ -133,12 +133,13 @@ const PRIORITY_META = {
 }
 
 const BUDGET_OPTIONS = [
-  { label: 'Under ₹10L', value: 10 },
-  { label: '₹10L – ₹20L', value: 20 },
-  { label: '₹20L – ₹30L', value: 30 },
-  { label: '₹30L – ₹50L', value: 50 },
-  { label: 'Above ₹50L', value: 80 },
+  { label: 'Under ₹10L',  min: 0,  max: 10  },
+  { label: '₹10L – ₹20L', min: 10, max: 20  },
+  { label: '₹20L – ₹30L', min: 20, max: 30  },
+  { label: '₹30L – ₹50L', min: 30, max: 50  },
+  { label: 'Above ₹50L',  min: 50, max: 100 },
 ]
+
 const PASSENGER_OPTIONS = [
   { label: 'Just Me (1-2)', value: '1-2' },
   { label: 'Small Family (3-4)', value: '3-4' },
@@ -162,7 +163,7 @@ const BRAND_OPTIONS = [
 ]
 const BRAND_MAX = 5
 
-// Background grid (shared with Landing)
+// Background grid
 const GridPattern = () => (
   <div
     className="absolute inset-0 pointer-events-none"
@@ -182,8 +183,8 @@ export default function Questionnaire() {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState(null)
 
-  // ── Answers — mapped to backend field names ──
-  const [budgetLakhs, setBudgetLakhs] = useState(null)
+  // ── Answers ──
+  const [budget, setBudget] = useState(null)           // { min, max, label }
   const [passengers, setPassengers] = useState(null)
   const [primaryUsage, setPrimaryUsage] = useState(null)
   const [bodyType, setBodyType] = useState(null)
@@ -216,7 +217,7 @@ export default function Questionnaire() {
   }
 
   const isStepValid = () => {
-    if (step === 1) return budgetLakhs !== null
+    if (step === 1) return budget !== null
     if (step === 2) return passengers !== null
     if (step === 3) return primaryUsage !== null
     if (step === 4) return bodyType !== null
@@ -233,12 +234,13 @@ export default function Questionnaire() {
       return
     }
 
-    // Step 6 — submit with correct backend field names
+    // Step 6 — submit
     setSubmitting(true)
     setError(null)
 
     const payload = {
-      budget_lakhs: budgetLakhs,
+      budget_min_lakhs: budget.min,
+      budget_lakhs: budget.max,
       passengers,
       primary_usage: primaryUsage,
       body_type: bodyType,
@@ -248,7 +250,6 @@ export default function Questionnaire() {
 
     try {
       const data = await getRecommendations(payload)
-      // Pass user_preferences along so /explain and /why-not can use it
       navigate('/results', { state: { ...data, user_preferences: payload } })
     } catch (err) {
       setError('Could not reach the server. Please check your connection.')
@@ -261,14 +262,7 @@ export default function Questionnaire() {
     if (step > 1) setStep((s) => s - 1)
   }
 
-  const stepHints = [
-    'Budget',
-    'Passengers',
-    'Usage',
-    'Body Type',
-    'Brands',
-    'Priorities',
-  ]
+  const stepHints = ['Budget', 'Passengers', 'Usage', 'Body Type', 'Brands', 'Priorities']
 
   return (
     <div
@@ -281,7 +275,6 @@ export default function Questionnaire() {
       <header className="relative z-10 px-6 pt-8 pb-4 max-w-xl mx-auto w-full">
         <div className="flex items-center justify-between mb-6">
           <button
-            id="back-btn"
             onClick={handleBack}
             disabled={step === 1}
             className="text-sm font-medium transition-all duration-200"
@@ -295,8 +288,6 @@ export default function Questionnaire() {
           >
             ← Back
           </button>
-
-          {/* Step label breadcrumb */}
           <span className="text-xs font-medium" style={{ color: '#3d6060' }}>
             {stepHints[step - 1]}
           </span>
@@ -319,10 +310,10 @@ export default function Questionnaire() {
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
               {BUDGET_OPTIONS.map((opt) => (
                 <Pill
-                  key={opt.value}
+                  key={opt.max}
                   label={opt.label}
-                  selected={budgetLakhs === opt.value}
-                  onClick={() => setBudgetLakhs(opt.value)}
+                  selected={budget?.max === opt.max}
+                  onClick={() => setBudget(opt)}
                 />
               ))}
             </div>
@@ -384,12 +375,14 @@ export default function Questionnaire() {
             </p>
             <div className="grid grid-cols-2 gap-3">
               {BODY_OPTIONS.map((opt) => (
-                <Pill
-                  key={opt.value}
-                  label={opt.label}
-                  selected={bodyType === opt.value}
-                  onClick={() => setBodyType(opt.value)}
-                />
+                <div key={opt.value} className={opt.value === 'no_preference' ? 'col-span-2' : ''}>
+                  <Pill
+                    label={opt.label}
+                    selected={bodyType === opt.value}
+                    onClick={() => setBodyType(opt.value)}
+                    fullWidth
+                  />
+                </div>
               ))}
             </div>
           </QuestionCard>
@@ -451,7 +444,7 @@ export default function Questionnaire() {
               What matters most to you?
             </h2>
             <p className="text-xs mb-3" style={{ color: '#7fa8a8' }}>
-              Drag to reorder — Your #1 choice carries the most weight.
+              Your #1 choice carries the most weight.
             </p>
             <DndContext
               sensors={sensors}
@@ -492,7 +485,6 @@ export default function Questionnaire() {
       {/* CTA footer */}
       <footer className="relative z-10 px-6 pb-10 pt-4 flex justify-center">
         <button
-          id="next-btn"
           onClick={handleNext}
           disabled={!isStepValid() || submitting}
           className="px-10 py-4 rounded-xl text-sm font-semibold tracking-wide transition-all duration-200"

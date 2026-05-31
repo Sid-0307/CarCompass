@@ -17,18 +17,18 @@ export default function CarCard({ car, topPick, userPreferences }) {
     >
       {/* Header */}
       <div className="flex items-start justify-between gap-3">
-        <div className="flex-1 min-w-0">
-          <p className="text-xs tracking-widest uppercase font-semibold mb-1" style={{ color: '#14b8a6' }}>
+        <div className="flex-1 min-w-0 flex flex-col gap-0.5">
+          <p className="text-xs tracking-widest uppercase font-semibold" style={{ color: '#14b8a6' }}>
             {car.brand}
           </p>
-          <h3 className="text-lg font-semibold leading-tight" style={{ color: '#e8f5f5' }}>
+          <h3 className="text-xl font-semibold leading-tight" style={{ color: '#e8f5f5' }}>
             {car.model}
-            {car.variant && (
-              <span className="text-base font-normal ml-1" style={{ color: '#7fa8a8' }}>
-                {car.variant}
-              </span>
-            )}
           </h3>
+          {car.variant && (
+            <p className="text-sm font-normal" style={{ color: '#7fa8a8' }}>
+              {car.variant}
+            </p>
+          )}
         </div>
         {car.body_type && (
           <span

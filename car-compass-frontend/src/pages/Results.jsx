@@ -94,7 +94,7 @@ export default function Results() {
   const scoreBreakdown = topPick.score_breakdown || {}
   const price = topPick.price_lakhs ?? topPick.price ?? '—'
 
-  // Fix 4 + Fix 5: fire explain on mount
+  // Prefetch explain and both why-not calls on mount
   useEffect(() => {
     // /explain
     getExplanation({
@@ -105,37 +105,32 @@ export default function Results() {
       .then((res) => setExplanationText(stripMarkdown(res.explanation || res.text || 'No explanation available.')))
       .catch(() => setExplanationText('Our adviser is unavailable at the moment.'))
       .finally(() => setExplanationLoading(false))
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleWhyNot0 = async () => {
-    setShowWhyNot0(v => !v)
-    if (whyNot0 || !alternatives[0]) return
-    try {
-      const res = await getWhyNot({
+    // /why-not prefetch for alternative 0
+    if (alternatives[0]) {
+      getWhyNot({
         user_preferences: userPreferences,
         rejected_car: alternatives[0],
         top_pick: topPick,
       })
-      setWhyNot0(stripMarkdown(res.explanation || ''))
-    } catch {
-      setWhyNot0('Could not load comparison at this time.')
+        .then((res) => setWhyNot0(stripMarkdown(res.explanation || '')))
+        .catch(() => setWhyNot0('Could not load comparison at this time.'))
     }
-  }
 
-  const handleWhyNot1 = async () => {
-    setShowWhyNot1(v => !v)
-    if (whyNot1 || !alternatives[1]) return
-    try {
-      const res = await getWhyNot({
+    // /why-not prefetch for alternative 1
+    if (alternatives[1]) {
+      getWhyNot({
         user_preferences: userPreferences,
         rejected_car: alternatives[1],
         top_pick: topPick,
       })
-      setWhyNot1(stripMarkdown(res.explanation || ''))
-    } catch {
-      setWhyNot1('Could not load comparison at this time.')
+        .then((res) => setWhyNot1(stripMarkdown(res.explanation || '')))
+        .catch(() => setWhyNot1('Could not load comparison at this time.'))
     }
-  }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleWhyNot0 = () => setShowWhyNot0(v => !v)
+  const handleWhyNot1 = () => setShowWhyNot1(v => !v)
 
   return (
     <div className="min-h-screen py-12 px-6" style={{ backgroundColor: '#0a0f0f' }}>

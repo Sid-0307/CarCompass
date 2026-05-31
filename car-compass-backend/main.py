@@ -1,6 +1,6 @@
 """
 Car Compass Backend — AI-native Indian car recommendation API
-FastAPI + Gemini 1.5 Flash + cars.json local database
+FastAPI + Gemini + cars.json local database
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ gemini_model = genai.GenerativeModel("gemini-2.5-flash") if GEMINI_API_KEY else 
 
 CARS_DB: list[dict] = []
 
+
 def load_cars() -> list[dict]:
     """Load and validate the cars database from cars.json."""
     db_path = Path(__file__).parent / "cars.json"
@@ -41,7 +42,9 @@ def load_cars() -> list[dict]:
         raise RuntimeError(f"cars.json not found at {db_path}")
     with open(db_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return data
+    cars = data if isinstance(data, list) else data.get("cars", [])
+    return cars
+
 
 # ---------------------------------------------------------------------------
 # FastAPI app initialisation
@@ -62,6 +65,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.on_event("startup")
 def startup_event():
     """Load cars database into memory on startup."""
@@ -69,11 +73,13 @@ def startup_event():
     CARS_DB = load_cars()
     print(f"[Car Compass] Loaded {len(CARS_DB)} cars from cars.json")
 
+
 # ---------------------------------------------------------------------------
 # Pydantic request/response models
 # ---------------------------------------------------------------------------
 
 class RecommendRequest(BaseModel):
+    budget_min_lakhs: float = Field(default=0, ge=0, description="Minimum budget in lakhs")
     budget_lakhs: float = Field(..., gt=0, description="Maximum budget in lakhs")
     passengers: str = Field(..., description="Expected passengers: '1-2', '3-4', or '5+'")
     primary_usage: str = Field(..., description="Usage pattern: 'city', 'highway', or 'mixed'")
@@ -95,19 +101,6 @@ class ScoreBreakdown(BaseModel):
     body_type_score: float
 
 
-class Gain(BaseModel):
-    attribute: str
-    top_pick_score: int
-    alt_scores: list[int]
-
-
-class Tradeoff(BaseModel):
-    attribute: str
-    top_pick_score: int
-    beaten_by: str       # e.g. "alternative_1"
-    by_how_much: int
-
-
 class CarResult(BaseModel):
     id: str
     brand: str
@@ -124,13 +117,8 @@ class CarResult(BaseModel):
     score_breakdown: ScoreBreakdown
 
 
-class TopPickResult(CarResult):
-    gains: list[Gain]
-    tradeoffs: list[Tradeoff]
-
-
 class RecommendResponse(BaseModel):
-    top_pick: TopPickResult
+    top_pick: CarResult
     alternatives: list[CarResult]
     user_preferences: RecommendRequest
 
@@ -159,22 +147,28 @@ class HealthResponse(BaseModel):
     status: str
     cars_loaded: int
 
+
 # ---------------------------------------------------------------------------
 # Scoring engine — purely algorithmic, no Gemini
 # ---------------------------------------------------------------------------
 
-# Priority weights for ranked list (up to 4 priorities)
+# Priority weights for ranked list (positions 1–4)
+# Position 1 carries 4x the weight of position 4
 PRIORITY_WEIGHTS = [0.40, 0.30, 0.20, 0.10]
 
 # Final score component weights
-WEIGHT_PRIORITY  = 0.40
-WEIGHT_USAGE     = 0.20
+# Budget and body type are already hard filters — lower soft weights to avoid double-counting
+# Priority and usage carry the real differentiation
+WEIGHT_PRIORITY  = 0.45
+WEIGHT_USAGE     = 0.25
 WEIGHT_FAMILY    = 0.15
-WEIGHT_BUDGET    = 0.15
-WEIGHT_BODY_TYPE = 0.10
+WEIGHT_BUDGET    = 0.10
+WEIGHT_BODY_TYPE = 0.05
 
-VALID_SCORE_KEYS = {"safety", "mileage", "features", "performance", "family_comfort",
-                    "city_drivability", "highway_drivability"}
+VALID_SCORE_KEYS = {
+    "safety", "mileage", "features", "performance",
+    "family_comfort", "city_drivability", "highway_drivability"
+}
 
 
 def compute_priority_score(car: dict, priorities: list[str]) -> float:
@@ -213,11 +207,23 @@ def compute_family_score(car: dict, passengers: str) -> float:
         return min(raw, 10.0)
 
 
-def compute_budget_score(car: dict, budget_lakhs: float) -> float:
-    """Reward cars well within budget (score out of 10, capped 0–10)."""
+def compute_budget_score(car: dict, budget_min: float, budget_max: float) -> float:
+    """
+    Reward cars well within the budget range (score out of 10).
+    Cars closer to the middle of the range score highest.
+    Cars at the edges score lower but still pass (they survived the hard filter).
+    """
     price = car["price_lakhs"]
-    raw = (budget_lakhs - price) / budget_lakhs * 10
-    return max(0.0, min(raw, 10.0))
+    budget_range = budget_max - budget_min
+    if budget_range <= 0:
+        return 10.0
+    # Score based on how well the price fits within the range
+    # Ideal = middle of the range, scores 10
+    midpoint = (budget_min + budget_max) / 2
+    distance_from_mid = abs(price - midpoint)
+    max_distance = budget_range / 2
+    score = 10.0 * (1 - (distance_from_mid / max_distance))
+    return max(0.0, min(score, 10.0))
 
 
 def compute_body_type_score(car: dict, requested_body_type: str) -> float:
@@ -232,7 +238,7 @@ def score_car(car: dict, req: RecommendRequest) -> tuple[float, ScoreBreakdown]:
     ps  = compute_priority_score(car, req.priorities)
     us  = compute_usage_score(car, req.primary_usage)
     fs  = compute_family_score(car, req.passengers)
-    bs  = compute_budget_score(car, req.budget_lakhs)
+    bs  = compute_budget_score(car, req.budget_min_lakhs, req.budget_lakhs)
     bts = compute_body_type_score(car, req.body_type)
 
     final = (
@@ -257,19 +263,22 @@ def score_car(car: dict, req: RecommendRequest) -> tuple[float, ScoreBreakdown]:
 def apply_hard_filters(cars: list[dict], req: RecommendRequest) -> list[dict]:
     """
     Step 1 — Hard Filters.
-    1. Remove cars above budget.
+    1. Remove cars outside the budget range (min to max).
     2. Filter to matching body type (unless no_preference).
     3. Filter to preferred brands (unless empty).
     4. If fewer than 3 remain, progressively relax: brands first, then body type.
     """
-    # --- Budget filter (non-relaxable) ---
-    budget_filtered = [c for c in cars if c["price_lakhs"] <= req.budget_lakhs]
+    # Budget filter — both floor and ceiling (non-relaxable)
+    budget_filtered = [
+        c for c in cars
+        if c["price_lakhs"] <= req.budget_lakhs
+        and c["price_lakhs"] >= req.budget_min_lakhs
+    ]
 
     # Normalise inputs for case-insensitive comparison
     requested_body = req.body_type.lower()
     preferred_brands_lower = [b.lower() for b in req.preferred_brands[:5]]
 
-    # --- Apply both brand + body filters ---
     def apply_body(pool: list[dict]) -> list[dict]:
         if requested_body == "no_preference":
             return pool
@@ -280,60 +289,22 @@ def apply_hard_filters(cars: list[dict], req: RecommendRequest) -> list[dict]:
             return pool
         return [c for c in pool if c["brand"].lower() in preferred_brands_lower]
 
-    # Full filter
+    # Full filter: brand + body type
     full_filtered = apply_brand(apply_body(budget_filtered))
     if len(full_filtered) >= 3:
         return full_filtered
 
-    # Relax brand filter
+    # Relax brand filter, keep body type
     body_only = apply_body(budget_filtered)
     if len(body_only) >= 3:
         return body_only
 
-    # Relax body type filter too (brand still relaxed)
+    # Relax both — return everything in budget
     if len(budget_filtered) >= 1:
         return budget_filtered
 
     return []
 
-
-def build_gains_tradeoffs(
-    top_pick: dict,
-    alternatives: list[dict],
-) -> tuple[list[Gain], list[Tradeoff]]:
-    """
-    Compare top_pick scores against both alternatives for every score attribute.
-    gains    → attributes where top_pick strictly beats BOTH alternatives.
-    tradeoffs → attributes where top_pick is strictly beaten by AT LEAST ONE alternative.
-    """
-    score_keys = list(VALID_SCORE_KEYS)
-    tp_scores = top_pick["scores"]
-    alt_score_list = [alt["scores"] for alt in alternatives]
-
-    gains: list[Gain] = []
-    tradeoffs: list[Tradeoff] = []
-
-    for key in score_keys:
-        tp_val = tp_scores.get(key, 0)
-        alt_vals = [a.get(key, 0) for a in alt_score_list]
-
-        if all(tp_val > av for av in alt_vals):
-            gains.append(Gain(
-                attribute=key,
-                top_pick_score=tp_val,
-                alt_scores=alt_vals,
-            ))
-        else:
-            for idx, av in enumerate(alt_vals):
-                if av > tp_val:
-                    tradeoffs.append(Tradeoff(
-                        attribute=key,
-                        top_pick_score=tp_val,
-                        beaten_by=f"alternative_{idx + 1}",
-                        by_how_much=av - tp_val,
-                    ))
-
-    return gains, tradeoffs
 
 # ---------------------------------------------------------------------------
 # Gemini helper
@@ -343,7 +314,7 @@ GEMINI_FALLBACK = "Our adviser is unavailable right now. Here are your results."
 
 
 def call_gemini(prompt: str) -> str:
-    """Call Gemini 1.5 Flash and return the text response; fall back gracefully."""
+    """Call Gemini and return the text response; fall back gracefully."""
     if not gemini_model:
         return GEMINI_FALLBACK
     try:
@@ -352,6 +323,7 @@ def call_gemini(prompt: str) -> str:
     except Exception as e:
         print(f"[Gemini] Error: {e}")
         return GEMINI_FALLBACK
+
 
 # ---------------------------------------------------------------------------
 # API Endpoints
@@ -367,11 +339,11 @@ def health_check():
 def recommend(req: RecommendRequest):
     """
     Pure algorithmic recommendation engine — no Gemini.
-    Step 1: Hard filters (budget → body type → brand).
+    Step 1: Hard filters (budget range → body type → brand).
     Step 2: Weighted multi-factor scoring.
     Step 3: Return top 3 (top_pick + 2 alternatives).
     """
-    # --- Step 1: Hard Filters ---
+    # Step 1: Hard Filters
     filtered_cars = apply_hard_filters(CARS_DB, req)
 
     if len(filtered_cars) < 1:
@@ -380,7 +352,7 @@ def recommend(req: RecommendRequest):
             detail="No cars match your filters. Try relaxing your brand or body type preference."
         )
 
-    # --- Step 2: Score every remaining car ---
+    # Step 2: Score every remaining car
     scored: list[tuple[dict, float, ScoreBreakdown]] = []
     for car in filtered_cars:
         final_score, breakdown = score_car(car, req)
@@ -389,7 +361,7 @@ def recommend(req: RecommendRequest):
     # Sort descending by final score
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    # --- Step 3: Pick top 3 ---
+    # Step 3: Pick top 3
     top_3 = scored[:3]
 
     def build_car_result(car: dict, final_score: float, breakdown: ScoreBreakdown) -> CarResult:
@@ -409,34 +381,8 @@ def recommend(req: RecommendRequest):
             score_breakdown=breakdown,
         )
 
-    # Build alternatives (ranks 2 & 3)
-    alternatives_raw = top_3[1:]
-    alt_cars = [a[0] for a in alternatives_raw]
-    alternatives_result = [
-        build_car_result(car, fs, bd) for (car, fs, bd) in alternatives_raw
-    ]
-
-    # Build top_pick with gains & tradeoffs
-    tp_car, tp_score, tp_breakdown = top_3[0]
-    gains, tradeoffs = build_gains_tradeoffs(tp_car, alt_cars)
-
-    top_pick_result = TopPickResult(
-        id=tp_car["id"],
-        brand=tp_car["brand"],
-        model=tp_car["model"],
-        variant=tp_car["variant"],
-        body_type=tp_car["body_type"],
-        price_lakhs=tp_car["price_lakhs"],
-        seating_capacity=tp_car["seating_capacity"],
-        fuel_type=tp_car["fuel_type"],
-        power_bhp=tp_car["power_bhp"],
-        fuel_efficiency_kmpl=tp_car["fuel_efficiency_kmpl"],
-        scores=tp_car["scores"],
-        final_score=tp_score,
-        score_breakdown=tp_breakdown,
-        gains=gains,
-        tradeoffs=tradeoffs,
-    )
+    top_pick_result = build_car_result(*top_3[0])
+    alternatives_result = [build_car_result(*t) for t in top_3[1:]]
 
     return RecommendResponse(
         top_pick=top_pick_result,
@@ -451,15 +397,53 @@ def explain(req: ExplainRequest):
     Call Gemini to generate a concise, specific explanation of why the top pick
     is the best match for the user's preferences.
     """
+    prefs = req.user_preferences
+    top = req.top_pick
+    alts = req.alternatives
+
+    budget_min = prefs.get("budget_min_lakhs", 0)
+    budget_max = prefs.get("budget_lakhs", "")
+    usage = prefs.get("primary_usage", "")
+    passengers = prefs.get("passengers", "")
+    priorities = prefs.get("priorities", [])
+    top_scores = top.get("scores", {})
+
+    # Build alternatives summary
+    alt_summaries = ""
+    for i, alt in enumerate(alts[:2], 1):
+        alt_summaries += (
+            f"Alternative {i}: {alt.get('brand')} {alt.get('model')} "
+            f"at ₹{alt.get('price_lakhs')}L (score {alt.get('final_score')}/10). "
+        )
+
+    # /explain prompt
     prompt = (
-        "You are a friendly but sharp car buying adviser.\n\n"
-        f"User preferences:\n{json.dumps(req.user_preferences, indent=2)}\n\n"
-        f"Top recommended car:\n{json.dumps(req.top_pick, indent=2)}\n\n"
-        f"Alternatives:\n{json.dumps(req.alternatives, indent=2)}\n\n"
-        "Based on the above, explain in 3-4 lines why the top pick is the best match. "
-        "Be specific, reference actual scores and user priorities. "
-        "No fluff, no filler. Plain English. "
-        "Respond in plain text only. No markdown, no asterisks, no bold, no bullet points, no headers. Write in flowing sentences only."
+        "You are a senior automotive journalist at a respected Indian car magazine. "
+        "You write with precision and authority — factual, specific, zero fluff. "
+        "Not conversational, not corporate. Sharp and readable.\n\n"
+        f"Buyer profile: ₹{budget_min}L–₹{budget_max}L budget, "
+        f"{usage} driving conditions, {passengers} passengers, "
+        f"ranked priorities: {', '.join(priorities)} (in descending order of importance).\n\n"
+        f"Top recommendation: {top.get('brand')} {top.get('model')} {top.get('variant')} "
+        f"at ₹{top.get('price_lakhs')}L — match score {top.get('final_score')}/10. "
+        f"Scores: safety {top_scores.get('safety')}/10, "
+        f"mileage {top_scores.get('mileage')}/10, "
+        f"performance {top_scores.get('performance')}/10, "
+        f"features {top_scores.get('features')}/10, "
+        f"city drivability {top_scores.get('city_drivability')}/10, "
+        f"highway drivability {top_scores.get('highway_drivability')}/10.\n\n"
+        f"Alternatives: {alt_summaries}\n\n"
+        "Write exactly 3 sentences:\n"
+        "Sentence 1: Where this car leads on the buyer's top two priorities — cite the actual scores "
+        "and what they mean in real terms.\n"
+        "Sentence 2: How it performs for this buyer's specific usage and passenger needs — "
+        "use the actual drivability scores.\n"
+        "Sentence 3: The one real trade-off and why it does not change the verdict given "
+        "what this buyer ranked as important.\n\n"
+        "Banned: no-brainer, seamless, perfect, ideal, truly, genuinely, absolutely, nails, "
+        "comprehensive, well-rounded, smart investment, stands out, ticks all boxes, "
+        "ownership satisfaction, dynamic responsiveness, feature density.\n"
+        "Plain text only. No markdown. No asterisks."
     )
     explanation = call_gemini(prompt)
     return ExplainResponse(explanation=explanation)
@@ -471,16 +455,56 @@ def why_not(req: WhyNotRequest):
     Call Gemini to explain why a specific car ranked lower than the top pick,
     and identify what type of buyer it would suit.
     """
+    prefs = req.user_preferences
+    top = req.top_pick
+    rejected = req.rejected_car
+
+    priorities = prefs.get("priorities", [])
+    usage = prefs.get("primary_usage", "")
+    budget_min = prefs.get("budget_min_lakhs", 0)
+    budget_max = prefs.get("budget_lakhs", "")
+    rejected_scores = rejected.get("scores", {})
+    top_scores = top.get("scores", {})
+
+    # /why-not prompt
     prompt = (
-        "You are a sharp car buying adviser.\n\n"
-        f"User preferences:\n{json.dumps(req.user_preferences, indent=2)}\n\n"
-        f"Top pick:\n{json.dumps(req.top_pick, indent=2)}\n\n"
-        f"Car being questioned:\n{json.dumps(req.rejected_car, indent=2)}\n\n"
-        "In 2-3 lines, explain why this car ranked lower than the top pick given these user preferences. "
-        "Be specific about the trade-offs. "
-        "Then in 1 line, describe what type of buyer should still consider this car. "
-        "Respond in plain text only. No markdown, no asterisks, no bold, no bullet points, no headers. Write in flowing sentences only."
+        "You are a senior automotive journalist at a respected Indian car magazine. "
+        "You write with precision and authority — factual, specific, zero fluff. "
+        "Not conversational, not corporate. Sharp and readable.\n\n"
+        f"Buyer profile: ₹{budget_min}L–₹{budget_max}L budget, "
+        f"{usage} driving conditions, "
+        f"ranked priorities: {', '.join(priorities)} (in descending order of importance).\n\n"
+        f"Top pick: {top.get('brand')} {top.get('model')} {top.get('variant')} "
+        f"(₹{top.get('price_lakhs')}L, match score {top.get('final_score')}/10) — "
+        f"safety {top_scores.get('safety')}/10, "
+        f"mileage {top_scores.get('mileage')}/10, "
+        f"performance {top_scores.get('performance')}/10, "
+        f"features {top_scores.get('features')}/10, "
+        f"city {top_scores.get('city_drivability')}/10, "
+        f"highway {top_scores.get('highway_drivability')}/10.\n\n"
+        f"Car under review: {rejected.get('brand')} {rejected.get('model')} {rejected.get('variant')} "
+        f"(₹{rejected.get('price_lakhs')}L, match score {rejected.get('final_score')}/10) — "
+        f"safety {rejected_scores.get('safety')}/10, "
+        f"mileage {rejected_scores.get('mileage')}/10, "
+        f"performance {rejected_scores.get('performance')}/10, "
+        f"features {rejected_scores.get('features')}/10, "
+        f"city {rejected_scores.get('city_drivability')}/10, "
+        f"highway {rejected_scores.get('highway_drivability')}/10.\n\n"
+        "Write exactly 3 sentences:\n"
+        "Sentence 1: Where this car scores lower than the top pick on the buyer's highest-ranked "
+        "priorities — cite the actual score gap, not vague adjectives.\n"
+        "Sentence 2: What that gap means specifically for this buyer's usage and requirements — "
+        "one concrete real-world consequence.\n"
+        "Sentence 3: The specific buyer this car would suit better — describe them in one line "
+        "with a concrete reason, not a generic profile.\n\n"
+        "Banned: falls short, lacks, unfortunately, however that said, despite, compromises, "
+        "perfect for, ideal for, great option, ownership satisfaction, dynamic responsiveness, "
+        "feature density, perception of robustness.\n"
+        "Plain text only. No markdown. No asterisks."
+        "Do not infer characteristics not present in the scores provided. "
+        "Only reference attributes that have explicit scores in the data above."
     )
+
     explanation = call_gemini(prompt)
     return WhyNotResponse(explanation=explanation)
 
@@ -490,4 +514,4 @@ def why_not(req: WhyNotRequest):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
