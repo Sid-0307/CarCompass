@@ -54,8 +54,8 @@ Given a few more hours, I would implement:
 ---
 
 ## Running Locally
-cd car-compass-backend && pip install -r requirements.txt && uvicorn main:app --reload
-cd car-compass-frontend && npm install && npm run dev
+- cd car-compass-backend && pip install -r requirements.txt && uvicorn main:app --reload
+- cd car-compass-frontend && npm install && npm run dev
 
 ---
 
